@@ -37,21 +37,32 @@ from utils import Config, set_seed
 
 
 def main():
-
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
     args = parser.parse_args()
 
-    # init distributed environment
-    dist.init_process_group("nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
+    # Initialize distributed environment if applicable
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        distributed = True
+    else:
+        # Fallback to single-process (non-distributed)
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        distributed = False
 
-    # load the configuration file
+    # Load the configuration file
     with open(args.config_file) as f:
         config_dict = yaml.safe_load(f)
+
+    # ↓ 你可以继续在这里使用 config_dict、local_rank、rank、distributed 等变量
+    print(f"Loaded config for rank {rank} (local_rank {local_rank}), distributed={distributed}")
 
     if rank == 0:
         print("Config:", config_dict)
@@ -63,7 +74,9 @@ def main():
     if not os.path.exists(save_dir) and rank == 0:
         os.makedirs(save_dir)
 
-    torch.distributed.barrier()
+    if distributed:
+        torch.distributed.barrier()
+
     cur_ckpts = os.listdir(save_dir)
 
     # check if the job is preempted and resumed.
@@ -180,14 +193,24 @@ def main():
     if configs.bf16:
         model.to(torch.bfloat16)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # if only eval, use ddp (to avoid bugs in fsdp)
     if configs.only_eval:
-        parallel_model = DDP(model, device_ids=[rank])
-
+        if dist.is_initialized():
+            parallel_model = DDP(model, device_ids=[rank])
+        else:
+            parallel_model = model.to(device)  # fallback: no DDP
     else:
-        parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
-        )
+        if dist.is_initialized():
+            parallel_model = FSDP(
+                model,
+                auto_wrap_policy=llama_auto_wrap_policy,
+                device_id=rank
+            )
+        else:
+            print("Warning: Not running with torch.distributed. FSDP will be skipped.")
+            parallel_model = model.to(device)  # fallback: no FSDP
 
     del model
 
